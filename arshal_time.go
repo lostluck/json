@@ -38,6 +38,8 @@ func makeTimeArshaler(fncs *arshaler, t reflect.Type) *arshaler {
 				} else {
 					return newInvalidFormatError("marshal", t, mo.format)
 				}
+			} else if mo.legacyDurationFormat {
+				return marshalNanos(mo, enc, va)
 			}
 
 			td := va.Interface().(time.Duration)
@@ -58,6 +60,8 @@ func makeTimeArshaler(fncs *arshaler, t reflect.Type) *arshaler {
 				} else {
 					return newInvalidFormatError("unmarshal", t, uo.format)
 				}
+			} else if uo.legacyDurationFormat {
+				return unmarshalNanos(uo, dec, va)
 			}
 
 			var flags valueFlags

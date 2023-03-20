@@ -43,12 +43,13 @@ type seenPointers map[typedPointer]struct{}
 type typedPointer struct {
 	typ reflect.Type
 	ptr any // always stores unsafe.Pointer, but avoids depending on unsafe
+	len int // remember slice length to avoid false positives
 }
 
 // visit visits pointer p of type t, reporting an error if seen before.
 // If successfully visited, then the caller must eventually call leave.
 func (m *seenPointers) visit(v reflect.Value) error {
-	p := typedPointer{v.Type(), v.UnsafePointer()}
+	p := typedPointer{v.Type(), v.UnsafePointer(), sliceLen(v)}
 	if _, ok := (*m)[p]; ok {
 		return &SemanticError{action: "marshal", GoType: p.typ, Err: errors.New("encountered a cycle")}
 	}
@@ -59,8 +60,15 @@ func (m *seenPointers) visit(v reflect.Value) error {
 	return nil
 }
 func (m *seenPointers) leave(v reflect.Value) {
-	p := typedPointer{v.Type(), v.UnsafePointer()}
+	p := typedPointer{v.Type(), v.UnsafePointer(), sliceLen(v)}
 	delete(*m, p)
+}
+
+func sliceLen(v reflect.Value) int {
+	if v.Kind() == reflect.Slice {
+		return v.Len()
+	}
+	return 0
 }
 
 func len64[Bytes ~[]byte | ~string](in Bytes) int64 {
@@ -109,6 +117,9 @@ func makeBoolArshaler(t reflect.Type) *arshaler {
 	fncs.marshal = func(mo MarshalOptions, enc *Encoder, va addressableValue) error {
 		if mo.format != "" && mo.formatDepth == enc.tokens.depth() {
 			return newInvalidFormatError("marshal", t, mo.format)
+		} else if mo.stringifyBoolsAndStrings {
+			b := append(strconv.AppendBool(append(enc.UnusedBuffer(), '"'), va.Bool()), '"')
+			return enc.WriteValue(b)
 		}
 
 		// Optimize for marshaling without preceding whitespace.
@@ -155,6 +166,12 @@ func makeStringArshaler(t reflect.Type) *arshaler {
 	fncs.marshal = func(mo MarshalOptions, enc *Encoder, va addressableValue) error {
 		if mo.format != "" && mo.formatDepth == enc.tokens.depth() {
 			return newInvalidFormatError("marshal", t, mo.format)
+		} else if mo.stringifyBoolsAndStrings {
+			b, err := appendString(nil, va.String(), !enc.options.AllowInvalidUTF8, enc.options.EscapeRune)
+			if err != nil {
+				return err
+			}
+			return enc.WriteToken(String(string(b)))
 		}
 		return enc.WriteToken(String(va.String()))
 	}
@@ -232,6 +249,13 @@ func makeBytesArshaler(t reflect.Type, fncs *arshaler) *arshaler {
 			default:
 				return newInvalidFormatError("marshal", t, mo.format)
 			}
+		} else if mo.legacyBytesArrayFormat && va.Kind() == reflect.Array {
+			mo.format = ""
+			return marshalDefault(mo, enc, va)
+		}
+		if mo.EmitNilSliceAsNull && va.Kind() == reflect.Slice && va.IsNil() {
+			// TODO: Provide a "emitempty" format override?
+			return enc.WriteToken(Null)
 		}
 		val := enc.UnusedBuffer()
 		b := va.Bytes()
@@ -267,6 +291,9 @@ func makeBytesArshaler(t reflect.Type, fncs *arshaler) *arshaler {
 			default:
 				return newInvalidFormatError("unmarshal", t, uo.format)
 			}
+		} else if uo.legacyBytesArrayFormat && va.Kind() == reflect.Array {
+			uo.format = ""
+			return unmarshalDefault(uo, dec, va)
 		}
 		var flags valueFlags
 		val, err := dec.readValue(&flags)
@@ -581,27 +608,39 @@ func makeMapArshaler(t reflect.Type) *arshaler {
 			defer enc.seenPointers.leave(va.Value)
 		}
 
+		emitNull := mo.EmitNilMapAsNull
 		if mo.format != "" && mo.formatDepth == enc.tokens.depth() {
-			if mo.format == "emitnull" {
-				if va.IsNil() {
-					return enc.WriteToken(Null)
-				}
+			switch mo.format {
+			case "emitnull":
+				emitNull = true
 				mo.format = ""
-			} else {
+			case "emitempty":
+				emitNull = false
+				mo.format = ""
+			default:
 				return newInvalidFormatError("marshal", t, mo.format)
 			}
+		} else if mo.legacyStringify {
+			mo.StringifyNumbers = false
+			mo.stringifyBoolsAndStrings = false
 		}
 
-		// Optimize for marshaling an empty map without any preceding whitespace.
+		// Handle empty slices.
 		n := va.Len()
-		if optimizeCommon && n == 0 && !enc.options.multiline && !enc.tokens.last.needObjectName() {
-			enc.buf = enc.tokens.mayAppendDelim(enc.buf, '{')
-			enc.buf = append(enc.buf, "{}"...)
-			enc.tokens.last.increment()
-			if enc.needFlush() {
-				return enc.flush()
+		if n == 0 {
+			if emitNull && va.IsNil() {
+				return enc.WriteToken(Null)
 			}
-			return nil
+			// Optimize for marshaling an empty map without any preceding whitespace.
+			if optimizeCommon && !enc.options.multiline && !enc.tokens.last.needObjectName() {
+				enc.buf = enc.tokens.mayAppendDelim(enc.buf, '{')
+				enc.buf = append(enc.buf, "{}"...)
+				enc.tokens.last.increment()
+				if enc.needFlush() {
+					return enc.flush()
+				}
+				return nil
+			}
 		}
 
 		once.Do(init)
@@ -622,6 +661,7 @@ func makeMapArshaler(t reflect.Type) *arshaler {
 				marshalVal, _ = mo.Marshalers.lookup(marshalVal, t.Elem())
 				nonDefaultKey = nonDefaultKey || ok
 			}
+			mo.forcedAddressability = true
 			k := newAddressableValue(t.Key())
 			v := newAddressableValue(t.Elem())
 
@@ -714,11 +754,15 @@ func makeMapArshaler(t reflect.Type) *arshaler {
 	}
 	fncs.unmarshal = func(uo UnmarshalOptions, dec *Decoder, va addressableValue) error {
 		if uo.format != "" && uo.formatDepth == dec.tokens.depth() {
-			if uo.format == "emitnull" {
+			switch uo.format {
+			case "emitnull", "emitempty":
 				uo.format = "" // only relevant for marshaling
-			} else {
+			default:
 				return newInvalidFormatError("unmarshal", t, uo.format)
 			}
+		} else if uo.legacyStringify {
+			uo.StringifyNumbers = false
+			uo.stringifyBoolsAndStrings = false
 		}
 		tok, err := dec.ReadToken()
 		if err != nil {
@@ -748,6 +792,7 @@ func makeMapArshaler(t reflect.Type) *arshaler {
 				unmarshalVal, _ = uo.Unmarshalers.lookup(unmarshalVal, t.Elem())
 				nonDefaultKey = nonDefaultKey || ok
 			}
+			uo.forcedAddressability = true
 			k := newAddressableValue(t.Key())
 			v := newAddressableValue(t.Elem())
 
@@ -848,9 +893,12 @@ func makeStructArshaler(t reflect.Type) *arshaler {
 	fncs.marshal = func(mo MarshalOptions, enc *Encoder, va addressableValue) error {
 		if mo.format != "" && mo.formatDepth == enc.tokens.depth() {
 			return newInvalidFormatError("marshal", t, mo.format)
+		} else if mo.legacyStringify {
+			mo.StringifyNumbers = false
+			mo.stringifyBoolsAndStrings = false
 		}
 		once.Do(init)
-		if errInit != nil {
+		if errInit != nil && !mo.legacyIgnoreStructErrors {
 			err := *errInit // shallow copy SemanticError
 			err.action = "marshal"
 			return &err
@@ -888,8 +936,12 @@ func makeStructArshaler(t reflect.Type) *arshaler {
 			// OmitEmpty skips the field if the marshaled JSON value is empty,
 			// which we can know up front if there are no custom marshalers,
 			// otherwise we must marshal the value and unwrite it if empty.
-			if f.omitempty && !nonDefault && f.isEmpty != nil && f.isEmpty(v) {
-				continue // fast path for omitempty
+			if f.omitempty {
+				if mo.legacyOmitEmpty && isLegacyEmpty(v) {
+					continue
+				} else if !nonDefault && f.isEmpty != nil && f.isEmpty(v) {
+					continue // fast path for omitempty
+				}
 			}
 
 			// Write the object member name.
@@ -932,6 +984,7 @@ func makeStructArshaler(t reflect.Type) *arshaler {
 			mo2 := mo
 			if f.string {
 				mo2.StringifyNumbers = true
+				mo2.stringifyBoolsAndStrings = mo.legacyStringify
 			}
 			if f.format != "" {
 				mo2.formatDepth = enc.tokens.depth()
@@ -942,7 +995,7 @@ func makeStructArshaler(t reflect.Type) *arshaler {
 			}
 
 			// Try unwriting the member if empty (slow path for omitempty).
-			if f.omitempty {
+			if f.omitempty && !mo.legacyOmitEmpty {
 				var prevName *string
 				if prevIdx >= 0 {
 					prevName = &fields.flattened[prevIdx].name
@@ -994,6 +1047,9 @@ func makeStructArshaler(t reflect.Type) *arshaler {
 	fncs.unmarshal = func(uo UnmarshalOptions, dec *Decoder, va addressableValue) error {
 		if uo.format != "" && uo.formatDepth == dec.tokens.depth() {
 			return newInvalidFormatError("unmarshal", t, uo.format)
+		} else if uo.legacyStringify {
+			uo.StringifyNumbers = false
+			uo.stringifyBoolsAndStrings = false
 		}
 		tok, err := dec.ReadToken()
 		if err != nil {
@@ -1006,7 +1062,7 @@ func makeStructArshaler(t reflect.Type) *arshaler {
 			return nil
 		case '{':
 			once.Do(init)
-			if errInit != nil {
+			if errInit != nil && !uo.legacyIgnoreStructErrors {
 				err := *errInit // shallow copy SemanticError
 				err.action = "unmarshal"
 				return &err
@@ -1067,6 +1123,7 @@ func makeStructArshaler(t reflect.Type) *arshaler {
 				uo2 := uo
 				if f.string {
 					uo2.StringifyNumbers = true
+					uo2.stringifyBoolsAndStrings = uo.legacyStringify
 				}
 				if f.format != "" {
 					uo2.formatDepth = dec.tokens.depth()
@@ -1109,6 +1166,7 @@ func (va addressableValue) indirect(mayAlloc bool) addressableValue {
 			}
 			va.Set(reflect.New(va.Type().Elem()))
 		}
+		// MUSTDO: Force addressability may be altered
 		va = addressableValue{va.Elem()} // dereferenced pointer is always addressable
 	}
 	return va
@@ -1132,27 +1190,39 @@ func makeSliceArshaler(t reflect.Type) *arshaler {
 			defer enc.seenPointers.leave(va.Value)
 		}
 
+		emitNull := mo.EmitNilSliceAsNull
 		if mo.format != "" && mo.formatDepth == enc.tokens.depth() {
-			if mo.format == "emitnull" {
-				if va.IsNil() {
-					return enc.WriteToken(Null)
-				}
+			switch mo.format {
+			case "emitnull":
+				emitNull = true
 				mo.format = ""
-			} else {
+			case "emitempty":
+				emitNull = false
+				mo.format = ""
+			default:
 				return newInvalidFormatError("marshal", t, mo.format)
 			}
+		} else if mo.legacyStringify {
+			mo.StringifyNumbers = false
+			mo.stringifyBoolsAndStrings = false
 		}
 
-		// Optimize for marshaling an empty slice without any preceding whitespace.
+		// Handle empty slices.
 		n := va.Len()
-		if optimizeCommon && n == 0 && !enc.options.multiline && !enc.tokens.last.needObjectName() {
-			enc.buf = enc.tokens.mayAppendDelim(enc.buf, '[')
-			enc.buf = append(enc.buf, "[]"...)
-			enc.tokens.last.increment()
-			if enc.needFlush() {
-				return enc.flush()
+		if n == 0 {
+			if emitNull && va.IsNil() {
+				return enc.WriteToken(Null)
 			}
-			return nil
+			// Optimize for marshaling an empty slice without any preceding whitespace.
+			if optimizeCommon && !enc.options.multiline && !enc.tokens.last.needObjectName() {
+				enc.buf = enc.tokens.mayAppendDelim(enc.buf, '[')
+				enc.buf = append(enc.buf, "[]"...)
+				enc.tokens.last.increment()
+				if enc.needFlush() {
+					return enc.flush()
+				}
+				return nil
+			}
 		}
 
 		once.Do(init)
@@ -1163,6 +1233,7 @@ func makeSliceArshaler(t reflect.Type) *arshaler {
 		if mo.Marshalers != nil {
 			marshal, _ = mo.Marshalers.lookup(marshal, t.Elem())
 		}
+		mo.forcedAddressability = false
 		for i := 0; i < n; i++ {
 			v := addressableValue{va.Index(i)} // indexed slice element is always addressable
 			if err := marshal(mo, enc, v); err != nil {
@@ -1177,11 +1248,15 @@ func makeSliceArshaler(t reflect.Type) *arshaler {
 	emptySlice := reflect.MakeSlice(t, 0, 0)
 	fncs.unmarshal = func(uo UnmarshalOptions, dec *Decoder, va addressableValue) error {
 		if uo.format != "" && uo.formatDepth == dec.tokens.depth() {
-			if uo.format == "emitnull" {
+			switch uo.format {
+			case "emitnull", "emitempty":
 				uo.format = "" // only relevant for marshaling
-			} else {
+			default:
 				return newInvalidFormatError("unmarshal", t, uo.format)
 			}
+		} else if uo.legacyStringify {
+			uo.StringifyNumbers = false
+			uo.stringifyBoolsAndStrings = false
 		}
 
 		tok, err := dec.ReadToken()
@@ -1205,6 +1280,7 @@ func makeSliceArshaler(t reflect.Type) *arshaler {
 				va.SetLen(cap)
 			}
 			var i int
+			uo.forcedAddressability = false
 			for dec.PeekKind() != ']' {
 				if i == cap {
 					va.Value.Grow(1)
@@ -1250,6 +1326,9 @@ func makeArrayArshaler(t reflect.Type) *arshaler {
 	fncs.marshal = func(mo MarshalOptions, enc *Encoder, va addressableValue) error {
 		if mo.format != "" && mo.formatDepth == enc.tokens.depth() {
 			return newInvalidFormatError("marshal", t, mo.format)
+		} else if mo.legacyStringify {
+			mo.StringifyNumbers = false
+			mo.stringifyBoolsAndStrings = false
 		}
 		once.Do(init)
 		if err := enc.WriteToken(ArrayStart); err != nil {
@@ -1273,6 +1352,9 @@ func makeArrayArshaler(t reflect.Type) *arshaler {
 	fncs.unmarshal = func(uo UnmarshalOptions, dec *Decoder, va addressableValue) error {
 		if uo.format != "" && uo.formatDepth == dec.tokens.depth() {
 			return newInvalidFormatError("unmarshal", t, uo.format)
+		} else if uo.legacyStringify {
+			uo.StringifyNumbers = false
+			uo.stringifyBoolsAndStrings = false
 		}
 		tok, err := dec.ReadToken()
 		if err != nil {
@@ -1343,6 +1425,7 @@ func makePointerArshaler(t reflect.Type) *arshaler {
 		if mo.Marshalers != nil {
 			marshal, _ = mo.Marshalers.lookup(marshal, t.Elem())
 		}
+		mo.forcedAddressability = false
 		v := addressableValue{va.Elem()} // dereferenced pointer is always addressable
 		return marshal(mo, enc, v)
 	}
@@ -1363,6 +1446,7 @@ func makePointerArshaler(t reflect.Type) *arshaler {
 		if va.IsNil() {
 			va.Set(reflect.New(t.Elem()))
 		}
+		uo.forcedAddressability = false
 		v := addressableValue{va.Elem()} // dereferenced pointer is always addressable
 		return unmarshal(uo, dec, v)
 	}
@@ -1378,10 +1462,14 @@ func makeInterfaceArshaler(t reflect.Type) *arshaler {
 	fncs.marshal = func(mo MarshalOptions, enc *Encoder, va addressableValue) error {
 		if mo.format != "" && mo.formatDepth == enc.tokens.depth() {
 			return newInvalidFormatError("marshal", t, mo.format)
+		} else if mo.legacyStringify {
+			mo.StringifyNumbers = false
+			mo.stringifyBoolsAndStrings = false
 		}
 		if va.IsNil() {
 			return enc.WriteToken(Null)
 		}
+		mo.forcedAddressability = true
 		v := newAddressableValue(va.Elem().Type())
 		v.Set(va.Elem())
 		marshal := lookupArshaler(v.Type()).marshal
@@ -1397,6 +1485,9 @@ func makeInterfaceArshaler(t reflect.Type) *arshaler {
 	fncs.unmarshal = func(uo UnmarshalOptions, dec *Decoder, va addressableValue) error {
 		if uo.format != "" && uo.formatDepth == dec.tokens.depth() {
 			return newInvalidFormatError("unmarshal", t, uo.format)
+		} else if uo.legacyStringify {
+			uo.StringifyNumbers = false
+			uo.stringifyBoolsAndStrings = false
 		}
 		if dec.PeekKind() == 'n' {
 			if _, err := dec.ReadToken(); err != nil {
@@ -1406,6 +1497,7 @@ func makeInterfaceArshaler(t reflect.Type) *arshaler {
 			return nil
 		}
 		var v addressableValue
+		uo.forcedAddressability = true
 		if va.IsNil() {
 			// Optimize for the any type if there are no special options.
 			// We do not care about stringified numbers since JSON strings

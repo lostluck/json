@@ -10,7 +10,66 @@ import (
 	"io"
 	"reflect"
 	"sync"
+	"unicode/utf8"
 )
+
+// marshalLegacy marshals nearly identically to "encoding/json".Marshal.
+//
+// Errata:
+//
+//   - ~[]NamedByte is encoded as a JSON array of unsigned integers,
+//     while v1 would encode it as as a Base-64 encoded JSON string.
+//     The v1 behavior depended on a bug in the "reflect" package.
+//     See https://go.dev/issue/24746.
+//
+//   - MarshalJSON is never called on nil pointers for
+//     Marshaler and encoding.TextMarshaler interface values,
+//     while v1 would inconsistently call it.
+//
+//   - MarshalText is never called on nil pointers for map keys
+//     and would result in a marshal error,
+//     while v1 would treat this as an empty JSON string.
+//
+//   - MarshalJSON is called (if it exists) for map keys,
+//     while v1 would ignore the presence of MarshalJSON methods.
+//
+//   - The output of Marshaler.MarshalJSON is always escaped according to
+//     the escaping specified by EncodeOptions.EscapeRune.
+//     The v1 behavior would keep pre-escaped runes as is.
+//
+//   - The `string` tag option recursively effects all pointer indirections,
+//     while in v1 it would only be effective for one layer of pointers.
+//
+//   - The exact error type and message may differ.
+func marshalLegacy(out *bytes.Buffer, in any, escapeHTML bool) error {
+	enc := getStreamingEncoder(out, EncodeOptions{
+		AllowInvalidUTF8:    true,
+		AllowDuplicateNames: true,
+		EscapeRune: func(r rune) bool {
+			switch r {
+			case '\b', '\f', utf8.RuneError:
+				return true
+			case '<', '>', '&', '\u2028', '\u2029':
+				return escapeHTML
+			default:
+				return false
+			}
+		},
+		omitTopLevelNewline: true,
+	})
+	defer putStreamingEncoder(enc)
+	return MarshalOptions{
+		Deterministic:            true,
+		EmitNilSliceAsNull:       true,
+		EmitNilMapAsNull:         true,
+		legacyAddressableMethods: true,
+		legacyOmitEmpty:          true,
+		legacyIgnoreStructErrors: true,
+		legacyBytesArrayFormat:   true,
+		legacyDurationFormat:     true,
+		legacyStringify:          true,
+	}.MarshalNext(enc, in)
+}
 
 // MarshalOptions configures how Go data is serialized as JSON data.
 // The zero value is equivalent to the default marshal settings.
@@ -21,6 +80,19 @@ type MarshalOptions struct {
 	// Marshalers is a list of type-specific marshalers to use.
 	Marshalers *Marshalers
 
+	// EmitNilSliceAsNull specifies that nil Go slices should marshal as a
+	// JSON null instead of the default representation as an empty JSON array
+	// (or a empty JSON string in the case of ~[]byte).
+	// Slice fields explicitly marked with `format:emitempty` still marshal
+	// as an empty JSON array.
+	EmitNilSliceAsNull bool
+
+	// EmitNilMapAsNull specifies that nil Go maps should marshal as a
+	// JSON null instead of the default representation as an empty JSON object.
+	// Map fields explicitly marked with `format:emitempty` still marshal
+	// as an empty JSON object.
+	EmitNilMapAsNull bool
+
 	// StringifyNumbers specifies that numeric Go types should be serialized
 	// as a JSON string containing the equivalent JSON number value.
 	//
@@ -29,6 +101,11 @@ type MarshalOptions struct {
 	// This may cause decoders to lose precision for int64 and uint64 types.
 	// Escaping JSON numbers as a JSON string preserves the exact precision.
 	StringifyNumbers bool
+
+	// stringifyBoolsAndStrings specifies that Go string and bool types
+	// should be serialized as a JSON string containing the equivalent JSON
+	// bool or string value. Only set if legacyStringify is set.
+	stringifyBoolsAndStrings bool
 
 	// DiscardUnknownMembers specifies that marshaling should ignore any
 	// JSON object members stored in Go struct fields dedicated to storing
@@ -41,6 +118,36 @@ type MarshalOptions struct {
 	// but different versions of the same program are not guaranteed
 	// to produce the exact same sequence of bytes.
 	Deterministic bool
+
+	// forcedAddressability reports whether the current value is
+	// addressable only because it was shallow copied on the heap.
+	forcedAddressability bool
+
+	// legacyAddressableMethods specifies whether to avoid calling Marshaler
+	// methods on unaddressable values.
+	legacyAddressableMethods bool
+
+	// legacyOmitEmpty specifies whether
+	legacyOmitEmpty bool
+
+	// legacyIgnoreStructErrors specifies whether to ignore errors for
+	// Go structs with malformed field tag options.
+	legacyIgnoreStructErrors bool
+
+	// legacyBytesArrayFormat specifies that ~[...]byte should be serialized
+	// as a JSON array of unsigned integers instead of the Base-64 encoding
+	// within a JSON string.
+	legacyBytesArrayFormat bool
+
+	// legacyDurationFormat specifies that time.Duration should be serialized
+	// as a decimal number of nanoseconds instead of using time.Duration.String.
+	legacyDurationFormat bool
+
+	// legacyStringify specifies that the `string` struct tag option should
+	// follow legacy semantics, where it also stringifies Go bools and strings
+	// (in addition to stringifying Go numbers). Stringification is not applied
+	// recursively through Go slices and maps.
+	legacyStringify bool
 
 	// formatDepth is the depth at which we respect the format flag.
 	formatDepth int
@@ -158,6 +265,8 @@ func (mo MarshalOptions) MarshalFull(eo EncodeOptions, out io.Writer, in any) er
 //     The Go map is traversed in a non-deterministic order.
 //     For deterministic encoding, consider using RawValue.Canonicalize.
 //     If the format is "emitnull", then a nil map is encoded as a JSON null.
+//     If the format is "emitempty", then a nil map is encoded as an empty JSON object,
+//     regardless of whether MarshalOptions.EmitNilMapAsNull is specified.
 //     Otherwise by default, a nil map is encoded as an empty JSON object.
 //
 //   - A Go struct is encoded as a JSON object.
@@ -167,6 +276,8 @@ func (mo MarshalOptions) MarshalFull(eo EncodeOptions, out io.Writer, in any) er
 //   - A Go slice is encoded as a JSON array, where each Go slice element
 //     is recursively JSON-encoded as the elements of the JSON array.
 //     If the format is "emitnull", then a nil slice is encoded as a JSON null.
+//     If the format is "emitempty", then a nil slice is encoded as an empty JSON array,
+//     regardless of whether MarshalOptions.EmitNilSliceAsNull is specified.
 //     Otherwise by default, a nil slice is encoded as an empty JSON array.
 //
 //   - A Go array is encoded as a JSON array, where each Go array element
@@ -207,6 +318,7 @@ func (mo MarshalOptions) MarshalNext(out *Encoder, in any) error {
 	// Shallow copy non-pointer values to obtain an addressable value.
 	// It is beneficial to performance to always pass pointers to avoid this.
 	if v.Kind() != reflect.Pointer {
+		mo.forcedAddressability = true
 		v2 := reflect.New(v.Type())
 		v2.Elem().Set(v)
 		v = v2
@@ -242,10 +354,42 @@ type UnmarshalOptions struct {
 	// without any surrounding whitespace.
 	StringifyNumbers bool
 
+	// stringifyBoolsAndStrings specifies that Go string and bool types
+	// should be serialized as a JSON string containing the equivalent JSON
+	// bool or string value. Only set if legacyStringify is set.
+	stringifyBoolsAndStrings bool
+
 	// RejectUnknownMembers specifies that unknown members should be rejected
 	// when unmarshaling a JSON object, regardless of whether there is a field
 	// to store unknown members.
 	RejectUnknownMembers bool
+
+	// forcedAddressability reports whether the current value is
+	// addressable only because it was shallow copied on the heap.
+	forcedAddressability bool
+
+	// legacyAddressableMethods specifies whether to avoid calling Unmarshaler
+	// methods on unaddressable values.
+	legacyAddressableMethods bool
+
+	// legacyIgnoreStructErrors specifies whether to ignore errors for
+	// Go structs with malformed field tag options.
+	legacyIgnoreStructErrors bool
+
+	// legacyBytesArrayFormat specifies that ~[...]byte should be serialized
+	// as a JSON array of unsigned integers instead of the Base-64 encoding
+	// within a JSON string.
+	legacyBytesArrayFormat bool
+
+	// legacyDurationFormat specifies that time.Duration should be serialized
+	// as a decimal number of nanoseconds instead of using time.Duration.String.
+	legacyDurationFormat bool
+
+	// legacyStringify specifies that the `string` struct tag option should
+	// follow legacy semantics, where it also stringifies Go bools and strings
+	// (in addition to stringifying Go numbers). Stringification is not applied
+	// recursively through Go slices and maps.
+	legacyStringify bool
 
 	// formatDepth is the depth at which we respect the format flag.
 	formatDepth int
@@ -385,7 +529,7 @@ func (uo UnmarshalOptions) unmarshalFull(in *Decoder, out any) error {
 //     If the Go map is nil, then a new map is allocated to decode into.
 //     If the decoded key matches an existing Go map entry, the entry value
 //     is reused by decoding the JSON object value into it.
-//     The only supported format is "emitnull" and has no effect when decoding.
+//     The formats "emitnull" or "emitempty" have no effect when decoding.
 //
 //   - A Go struct is decoded from a JSON object.
 //     See the “JSON Representation of Go structs” section
@@ -395,7 +539,7 @@ func (uo UnmarshalOptions) unmarshalFull(in *Decoder, out any) error {
 //     is recursively decoded and appended to the Go slice.
 //     Before appending into a Go slice, a new slice is allocated if it is nil,
 //     otherwise the slice length is reset to zero.
-//     The only supported format is "emitnull" and has no effect when decoding.
+//     The formats "emitnull" or "emitempty" have no effect when decoding.
 //
 //   - A Go array is decoded from a JSON array, where each JSON array element
 //     is recursively decoded as each corresponding Go array element.

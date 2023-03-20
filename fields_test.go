@@ -197,6 +197,13 @@ func TestMakeStructFields(t *testing.T) {
 			inlinedFallback: &structField{id: 0, index: []int{2}, typ: reflect.TypeOf(map[string]RawValue(nil)), fieldOptions: fieldOptions{name: "X", quotedName: `"X"`, unknown: true}},
 		},
 	}, {
+		name: name("InlinedFallback/InvalidImplicit"),
+		in: struct {
+			MapStringAny
+		}{},
+		want:    structFields{},
+		wantErr: errors.New("embedded Go struct field MapStringAny of non-struct type json.MapStringAny must be explicitly marked as `inline` or given a JSON name"),
+	}, {
 		name: name("InvalidUTF8"),
 		in: struct {
 			Name string `json:"'\\xde\\xad\\xbe\\xef'"`
@@ -299,10 +306,10 @@ func TestMakeStructFields(t *testing.T) {
 	}, {
 		name: name("DuplicateEmbedInline"),
 		in: struct {
-			MapStringAny
-			B RawValue `json:",inline"`
+			A MapStringAny `json:",inline"`
+			B RawValue     `json:",inline"`
 		}{},
-		wantErr: errors.New(`inlined Go struct fields MapStringAny and B cannot both be a Go map or json.RawValue`),
+		wantErr: errors.New(`inlined Go struct fields A and B cannot both be a Go map or json.RawValue`),
 	}}
 
 	for _, tt := range tests {
@@ -355,6 +362,7 @@ func TestMakeStructFields(t *testing.T) {
 			var gotErr error
 			if err != nil {
 				gotErr = err.Err
+				got = structFields{} // MUSTDO
 			}
 
 			if !reflect.DeepEqual(got, tt.want) || !reflect.DeepEqual(gotErr, tt.wantErr) {
@@ -408,7 +416,7 @@ func TestParseTagOptions(t *testing.T) {
 		in: struct {
 			unexported
 		}{},
-		wantIgnored: true,
+		wantIgnored: false,
 		wantErr:     errors.New("embedded Go struct field unexported of an unexported type must be explicitly ignored with a `json:\"-\"` tag"),
 	}, {
 		name: name("Ignored"),

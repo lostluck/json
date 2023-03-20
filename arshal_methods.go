@@ -89,10 +89,14 @@ func makeMethodArshaler(fncs *arshaler, t reflect.Type) *arshaler {
 	}
 
 	// Handle custom marshaler.
+	marshalDefault := fncs.marshal
 	switch which, needAddr := implementsWhich(t, jsonMarshalerV2Type, jsonMarshalerV1Type, textMarshalerType); which {
 	case jsonMarshalerV2Type:
 		fncs.nonDefault = true
 		fncs.marshal = func(mo MarshalOptions, enc *Encoder, va addressableValue) error {
+			if mo.legacyAddressableMethods && needAddr && mo.forcedAddressability {
+				return marshalDefault(mo, enc, va)
+			}
 			prevDepth, prevLength := enc.tokens.depthLength()
 			err := va.addrWhen(needAddr).Interface().(MarshalerV2).MarshalNextJSON(mo, enc)
 			currDepth, currLength := enc.tokens.depthLength()
@@ -109,6 +113,9 @@ func makeMethodArshaler(fncs *arshaler, t reflect.Type) *arshaler {
 	case jsonMarshalerV1Type:
 		fncs.nonDefault = true
 		fncs.marshal = func(mo MarshalOptions, enc *Encoder, va addressableValue) error {
+			if mo.legacyAddressableMethods && needAddr && mo.forcedAddressability {
+				return marshalDefault(mo, enc, va)
+			}
 			marshaler := va.addrWhen(needAddr).Interface().(MarshalerV1)
 			val, err := marshaler.MarshalJSON()
 			if err != nil {
@@ -125,6 +132,9 @@ func makeMethodArshaler(fncs *arshaler, t reflect.Type) *arshaler {
 	case textMarshalerType:
 		fncs.nonDefault = true
 		fncs.marshal = func(mo MarshalOptions, enc *Encoder, va addressableValue) error {
+			if mo.legacyAddressableMethods && needAddr && mo.forcedAddressability {
+				return marshalDefault(mo, enc, va)
+			}
 			marshaler := va.addrWhen(needAddr).Interface().(encoding.TextMarshaler)
 			s, err := marshaler.MarshalText()
 			if err != nil {
@@ -146,10 +156,14 @@ func makeMethodArshaler(fncs *arshaler, t reflect.Type) *arshaler {
 	}
 
 	// Handle custom unmarshaler.
+	unmarshalDefault := fncs.unmarshal
 	switch which, needAddr := implementsWhich(t, jsonUnmarshalerV2Type, jsonUnmarshalerV1Type, textUnmarshalerType); which {
 	case jsonUnmarshalerV2Type:
 		fncs.nonDefault = true
 		fncs.unmarshal = func(uo UnmarshalOptions, dec *Decoder, va addressableValue) error {
+			if needAddr && uo.legacyAddressableMethods && uo.forcedAddressability {
+				return unmarshalDefault(uo, dec, va)
+			}
 			prevDepth, prevLength := dec.tokens.depthLength()
 			err := va.addrWhen(needAddr).Interface().(UnmarshalerV2).UnmarshalNextJSON(uo, dec)
 			currDepth, currLength := dec.tokens.depthLength()
@@ -166,6 +180,9 @@ func makeMethodArshaler(fncs *arshaler, t reflect.Type) *arshaler {
 	case jsonUnmarshalerV1Type:
 		fncs.nonDefault = true
 		fncs.unmarshal = func(uo UnmarshalOptions, dec *Decoder, va addressableValue) error {
+			if needAddr && uo.legacyAddressableMethods && uo.forcedAddressability {
+				return unmarshalDefault(uo, dec, va)
+			}
 			val, err := dec.ReadValue()
 			if err != nil {
 				return err // must be a syntactic or I/O error
@@ -181,6 +198,9 @@ func makeMethodArshaler(fncs *arshaler, t reflect.Type) *arshaler {
 	case textUnmarshalerType:
 		fncs.nonDefault = true
 		fncs.unmarshal = func(uo UnmarshalOptions, dec *Decoder, va addressableValue) error {
+			if needAddr && uo.legacyAddressableMethods && uo.forcedAddressability {
+				return unmarshalDefault(uo, dec, va)
+			}
 			var flags valueFlags
 			val, err := dec.readValue(&flags)
 			if err != nil {

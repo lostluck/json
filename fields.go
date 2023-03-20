@@ -18,8 +18,6 @@ import (
 	"golang.org/x/exp/slices"
 )
 
-var errIgnoredField = errors.New("ignored field")
-
 type isZeroer interface {
 	IsZero() bool
 }
@@ -44,6 +42,8 @@ type structField struct {
 }
 
 func makeStructFields(root reflect.Type) (structFields, *SemanticError) {
+	var errLazy error
+
 	// Setup a queue for a breath-first search.
 	var queueIndex int
 	type queueEntry struct {
@@ -72,8 +72,9 @@ func makeStructFields(root reflect.Type) (structFields, *SemanticError) {
 			hasAnyJSONTag = hasAnyJSONTag || hasTag
 			options, ignored, err := parseFieldOptions(sf)
 			if err != nil {
-				return structFields{}, &SemanticError{GoType: t, Err: err}
-			} else if ignored {
+				errLazy = firstError(errLazy, &SemanticError{GoType: t, Err: err})
+			}
+			if ignored {
 				continue
 			}
 			hasAnyJSONField = true
@@ -86,7 +87,12 @@ func makeStructFields(root reflect.Type) (structFields, *SemanticError) {
 				fieldOptions: options,
 			}
 			if sf.Anonymous && !f.hasName {
-				f.inline = true // implied by use of Go embedding without an explicit name
+				if tf := indirectType(f.typ); tf.Kind() != reflect.Struct {
+					err := fmt.Errorf("embedded Go struct field %s of non-struct type %s must be explicitly marked as `inline` or given a JSON name", sf.Name, tf)
+					errLazy = firstError(errLazy, &SemanticError{GoType: t, Err: err})
+				} else {
+					f.inline = true // implied by use of Go embedding without an explicit name
+				}
 			}
 			if f.inline || f.unknown {
 				// Handle an inlined field that serializes to/from
@@ -94,30 +100,28 @@ func makeStructFields(root reflect.Type) (structFields, *SemanticError) {
 
 				if f.inline && f.unknown {
 					err := fmt.Errorf("Go struct field %s cannot have both `inline` and `unknown` specified", sf.Name)
-					return structFields{}, &SemanticError{GoType: t, Err: err}
+					errLazy = firstError(errLazy, &SemanticError{GoType: t, Err: err})
+					continue
 				}
 				switch f.fieldOptions {
 				case fieldOptions{name: f.name, quotedName: f.quotedName, inline: true}:
 				case fieldOptions{name: f.name, quotedName: f.quotedName, unknown: true}:
 				default:
 					err := fmt.Errorf("Go struct field %s cannot have any options other than `inline` or `unknown` specified", sf.Name)
-					return structFields{}, &SemanticError{GoType: t, Err: err}
+					errLazy = firstError(errLazy, &SemanticError{GoType: t, Err: err})
+					continue
 				}
 
-				// Unwrap one level of pointer indirection similar to how Go
-				// only allows embedding either T or *T, but not **T.
-				tf := f.typ
-				if tf.Kind() == reflect.Pointer && tf.Name() == "" {
-					tf = tf.Elem()
-				}
 				// Reject any types with custom serialization otherwise
 				// it becomes impossible to know what sub-fields to inline.
+				tf := indirectType(f.typ)
 				if which, _ := implementsWhich(tf,
 					jsonMarshalerV2Type, jsonMarshalerV1Type, textMarshalerType,
 					jsonUnmarshalerV2Type, jsonUnmarshalerV1Type, textUnmarshalerType,
 				); which != nil && tf != rawValueType {
 					err := fmt.Errorf("inlined Go struct field %s of type %s must not implement JSON marshal or unmarshal methods", sf.Name, tf)
-					return structFields{}, &SemanticError{GoType: t, Err: err}
+					errLazy = firstError(errLazy, &SemanticError{GoType: t, Err: err})
+					continue
 				}
 
 				// Handle an inlined field that serializes to/from
@@ -125,7 +129,8 @@ func makeStructFields(root reflect.Type) (structFields, *SemanticError) {
 				if tf.Kind() == reflect.Struct {
 					if f.unknown {
 						err := fmt.Errorf("inlined Go struct field %s of type %s with `unknown` tag must be a Go map of string key or a json.RawValue", sf.Name, tf)
-						return structFields{}, &SemanticError{GoType: t, Err: err}
+						errLazy = firstError(errLazy, &SemanticError{GoType: t, Err: err})
+						continue
 					}
 					if qe.visitChildren {
 						queue = append(queue, queueEntry{tf, f.index, !seen[tf]})
@@ -143,13 +148,15 @@ func makeStructFields(root reflect.Type) (structFields, *SemanticError) {
 					f.fncs = lookupArshaler(tf.Elem())
 				default:
 					err := fmt.Errorf("inlined Go struct field %s of type %s must be a Go struct, Go map of string key, or json.RawValue", sf.Name, tf)
-					return structFields{}, &SemanticError{GoType: t, Err: err}
+					errLazy = firstError(errLazy, &SemanticError{GoType: t, Err: err})
+					continue
 				}
 
 				// Reject multiple inlined fallback fields within the same struct.
 				if inlinedFallbackIndex >= 0 {
 					err := fmt.Errorf("inlined Go struct fields %s and %s cannot both be a Go map or json.RawValue", t.Field(inlinedFallbackIndex).Name, sf.Name)
-					return structFields{}, &SemanticError{GoType: t, Err: err}
+					errLazy = firstError(errLazy, &SemanticError{GoType: t, Err: err})
+					continue
 				}
 				inlinedFallbackIndex = i
 
@@ -189,12 +196,14 @@ func makeStructFields(root reflect.Type) (structFields, *SemanticError) {
 				// Reject user-specified names with invalid UTF-8.
 				if !utf8.ValidString(f.name) {
 					err := fmt.Errorf("Go struct field %s has JSON object name %q with invalid UTF-8", sf.Name, f.name)
-					return structFields{}, &SemanticError{GoType: t, Err: err}
+					errLazy = firstError(errLazy, &SemanticError{GoType: t, Err: err})
+					continue
 				}
 				// Reject multiple fields with same name within the same struct.
 				if j, ok := namesIndex[f.name]; ok {
 					err := fmt.Errorf("Go struct fields %s and %s conflict over JSON object name %q", t.Field(j).Name, sf.Name, f.name)
-					return structFields{}, &SemanticError{GoType: t, Err: err}
+					errLazy = firstError(errLazy, &SemanticError{GoType: t, Err: err})
+					continue
 				}
 				namesIndex[f.name] = i
 
@@ -216,7 +225,8 @@ func makeStructFields(root reflect.Type) (structFields, *SemanticError) {
 		isEmptyStruct := t.NumField() == 0
 		if !isEmptyStruct && !hasAnyJSONTag && !hasAnyJSONField {
 			err := errors.New("Go struct has no exported fields")
-			return structFields{}, &SemanticError{GoType: t, Err: err}
+			errLazy = firstError(errLazy, &SemanticError{GoType: t, Err: err})
+			continue
 		}
 	}
 
@@ -291,7 +301,19 @@ func makeStructFields(root reflect.Type) (structFields, *SemanticError) {
 		fs.inlinedFallback = &inlinedFallbacks[0] // dominant inlined fallback field
 	}
 
+	if serr, _ := errLazy.(*SemanticError); serr != nil {
+		return fs, serr
+	}
 	return fs, nil
+}
+
+// indirectType unwraps one level of pointer indirection
+// similar to how Go only allows embedding either T or *T, but not **T.
+func indirectType(t reflect.Type) reflect.Type {
+	if t.Kind() == reflect.Pointer && t.Name() == "" {
+		t = t.Elem()
+	}
+	return t
 }
 
 type fieldOptions struct {
@@ -320,19 +342,21 @@ func parseFieldOptions(sf reflect.StructField) (out fieldOptions, ignored bool, 
 
 	// Check whether this field is unexported.
 	if !sf.IsExported() {
+		ignored = true
 		// In contrast to v1, v2 no longer forwards exported fields from
 		// embedded fields of unexported types since Go reflection does not
 		// allow the same set of operations that are available in normal cases
 		// of purely exported fields.
 		// See https://go.dev/issue/21357 and https://go.dev/issue/24153.
 		if sf.Anonymous {
+			ignored = indirectType(sf.Type).Kind() != reflect.Struct // for legacy v1 compatibility
 			err = firstError(err, fmt.Errorf("embedded Go struct field %s of an unexported type must be explicitly ignored with a `json:\"-\"` tag", sf.Type.Name()))
 		}
 		// Tag options specified on an unexported field suggests user error.
 		if hasTag {
 			err = firstError(err, fmt.Errorf("unexported Go struct field %s cannot have non-ignored `json:%q` tag", sf.Name, tag))
 		}
-		return fieldOptions{}, true, err
+		return fieldOptions{}, ignored, err
 	}
 
 	// Determine the JSON member name for this Go field. A user-specified name
@@ -437,6 +461,24 @@ func parseFieldOptions(sf reflect.StructField) (out fieldOptions, ignored bool, 
 		seenOpts[opt] = true
 	}
 	return out, false, err
+}
+
+func isLegacyEmpty(v addressableValue) bool {
+	switch v.Kind() {
+	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+		return v.Len() == 0
+	case reflect.Bool:
+		return v.Bool() == false
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int() == 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v.Uint() == 0
+	case reflect.Float32, reflect.Float64:
+		return v.Float() == 0
+	case reflect.Interface, reflect.Pointer:
+		return v.IsNil()
+	}
+	return false
 }
 
 func consumeTagOption(in string) (string, int, error) {
